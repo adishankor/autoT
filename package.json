@@ -1,0 +1,19 @@
+{
+  "name": "claude-bybit-bot",
+  "version": "4.0.0",
+  "description": "Claude AI 24/7 Bybit spot trading bot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "dotenv": "^16.3.1",
+    "node-cron": "^3.0.3",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": { "nodemon": "^3.0.1" },
+  "engines": { "node": ">=18.0.0" }
+}
