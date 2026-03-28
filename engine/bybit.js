@@ -1,126 +1,128 @@
-const fetch = require("node-fetch");
+// ─────────────────────────────────────────────────────────────────────────────
+// bybit.js  V5
+// Changes: safeJson (HTML detection), fallback domain api.bytick.com,
+//          klinesOpt (non-fatal), tickers24h for volume fallback
+// ─────────────────────────────────────────────────────────────────────────────
+const fetch  = require("node-fetch");
 const crypto = require("crypto");
-const BASE = "https://api.bybit.com";
 
-function sign(key, secret, ts, paramStr) {
-  return crypto.createHmac("sha256", secret).update(ts + key + "5000" + paramStr).digest("hex");
+// Primary → fallback domain (same Bybit API, different CDN)
+const DOMAINS = ["https://api.bybit.com", "https://api.bytick.com"];
+
+function sign(key, secret, ts, str) {
+  return crypto.createHmac("sha256", secret).update(ts + key + "5000" + str).digest("hex");
 }
 
-async function call(method, path, params = {}, auth = false) {
+// Detect HTML error pages (geo-block / rate-limit responses)
+async function safeJson(r) {
+  const text = await r.text();
+  if (text.trimStart().startsWith("<"))
+    throw new Error(`Bybit returned HTML (${r.status}) — likely IP rate-limited`);
+  try { return JSON.parse(text); }
+  catch { throw new Error(`Bybit invalid JSON: ${text.slice(0,60)}`); }
+}
+
+async function call(method, path, params={}, auth=false) {
   const key = process.env.BYBIT_API_KEY;
-  const secret = process.env.BYBIT_API_SECRET;
-  const ts = Date.now().toString();
-  let url = BASE + path;
-  let body, headers = { "Content-Type": "application/json" };
+  const sec = process.env.BYBIT_API_SECRET;
+  const ts  = Date.now().toString();
+  let body;
+
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept":        "application/json",
+    "User-Agent":    "Mozilla/5.0 (compatible; BybitBot/5.0)",
+  };
 
   if (auth) {
-    if (!key || !secret) throw new Error("Bybit API keys missing");
-    Object.assign(headers, { "X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000" });
+    if (!key || !sec) throw new Error("Bybit API keys missing in .env");
+    Object.assign(headers, { "X-BAPI-API-KEY":key, "X-BAPI-TIMESTAMP":ts, "X-BAPI-RECV-WINDOW":"5000" });
   }
 
-  if (method === "GET") {
-    const qs = new URLSearchParams(params).toString();
-    if (auth) headers["X-BAPI-SIGN"] = sign(key, secret, ts, qs);
-    if (qs) url += "?" + qs;
-  } else {
-    body = JSON.stringify(params);
-    if (auth) headers["X-BAPI-SIGN"] = sign(key, secret, ts, body);
+  let lastErr;
+  for (const base of DOMAINS) {
+    let url = base + path;
+    if (method === "GET") {
+      const qs = new URLSearchParams(params).toString();
+      if (auth) headers["X-BAPI-SIGN"] = sign(key, sec, ts, qs);
+      if (qs) url += "?" + qs;
+    } else {
+      body = JSON.stringify(params);
+      if (auth) headers["X-BAPI-SIGN"] = sign(key, sec, ts, body);
+    }
+    try {
+      const r = await fetch(url, { method, headers, body, timeout:10000 });
+      const d = await safeJson(r);
+      if (d.retCode !== undefined && d.retCode !== 0)
+        throw new Error(`Bybit ${d.retCode}: ${d.retMsg}`);
+      return d.result ?? d;
+    } catch(e) {
+      lastErr = e;
+      // Only try fallback domain for HTML/network errors, not auth errors
+      if (e.message.includes("HTML") || e.message.includes("ECONNRESET") || e.message.includes("timeout")) continue;
+      throw e;
+    }
   }
-
-  const r = await fetch(url, { method, headers, body });
-  const d = await r.json();
-  if (d.retCode !== undefined && d.retCode !== 0)
-    throw new Error(`Bybit ${d.retCode}: ${d.retMsg}`);
-  return d.result ?? d;
+  throw lastErr;
 }
 
-const ticker        = (s) => call("GET", "/v5/market/tickers", { category:"spot", symbol:s });
-const klines        = (s, i="15", l=80) => call("GET", "/v5/market/kline", { category:"spot", symbol:s, interval:i, limit:l });
-const instruments   = () => call("GET", "/v5/market/instruments-info", { category:"spot", limit:500 });
-const announcements = () => call("GET", "/v5/announcements/index", { locale:"en-US", page:1, limit:30 }).catch(()=>({ list:[] }));
-const orderbook     = (s, depth=50) => call("GET", "/v5/market/orderbook", { category:"spot", symbol:s, limit:depth });
-// Perp funding rate — free public endpoint, no auth needed
-const fundingRate   = (s="BTCUSDT") => call("GET", "/v5/market/funding/history", { category:"linear", symbol:s, limit:2 }).catch(()=>({ list:[] }));
+// ── Market data ───────────────────────────────────────────────────────────────
+const ticker       = (s) => call("GET", "/v5/market/tickers", { category:"spot", symbol:s });
+const klines       = (s,i="15",l=80) => call("GET", "/v5/market/kline", { category:"spot", symbol:s, interval:i, limit:l });
+// klinesOpt — returns null instead of throwing (for optional TFs like 1D)
+const klinesOpt    = async (s,i,l) => { try { return await klines(s,i,l); } catch { return null; } };
+const instruments  = () => call("GET", "/v5/market/instruments-info", { category:"spot", limit:500 });
+const announcements= () => call("GET", "/v5/announcements/index", { locale:"en-US", page:1, limit:30 }).catch(()=>({list:[]}));
+const orderbook    = (s,d=50) => call("GET", "/v5/market/orderbook", { category:"spot", symbol:s, limit:d });
+const fundingRate  = (s="BTCUSDT") => call("GET", "/v5/market/funding/history", { category:"linear", symbol:s, limit:2 }).catch(()=>({list:[]}));
+// All 24h tickers — used as Bybit-native volume ranking fallback
+const tickers24h   = () => call("GET", "/v5/market/tickers", { category:"spot" });
 
+// ── Account ───────────────────────────────────────────────────────────────────
 async function getBalances() {
   const d = await call("GET", "/v5/account/wallet-balance", { accountType:"UNIFIED" }, true);
   const coins = d.list?.[0]?.coin || [];
   return {
-    usdtBal: parseFloat(coins.find(c=>c.coin==="USDT")?.walletBalance || 0),
+    usdtBal:  parseFloat(coins.find(c=>c.coin==="USDT")?.walletBalance || 0),
     totalUSD: parseFloat(d.list?.[0]?.totalEquity || 0),
-    coins: coins.filter(c=>parseFloat(c.walletBalance)>0)
+    coins:    coins.filter(c => parseFloat(c.walletBalance) > 0),
   };
 }
 
 async function placeOrder(symbol, side, qty) {
   return call("POST", "/v5/order/create", {
     category:"spot", symbol, side, orderType:"Market",
-    qty: qty.toString(), timeInForce:"IOC"
+    qty: qty.toString(), timeInForce:"IOC",
   }, true);
 }
 
-// ── WEAKNESS 3: Orderbook wall analysis ──────────────────────────────────────
-// Bybit orderbook format: { b: [[price,qty],...], a: [[price,qty],...] }
+// ── Order book analysis ───────────────────────────────────────────────────────
 function analyzeOrderbook(raw, currentPrice) {
   if (!raw?.b || !raw?.a) return null;
-
-  const parse = (side) => side.map(([p, q]) => {
-    const price = parseFloat(p), qty = parseFloat(q);
-    return { price, qty, value: price * qty };
-  });
-
-  const bids = parse(raw.b); // buy orders — support side
-  const asks = parse(raw.a); // sell orders — resistance side
-
+  const parse = side => side.map(([p,q]) => ({ price:parseFloat(p), qty:parseFloat(q), value:parseFloat(p)*parseFloat(q) }));
+  const bids = parse(raw.b), asks = parse(raw.a);
   if (!bids.length || !asks.length) return null;
-
-  // Wall = any order whose USD value is ≥ 3× the average of its side
-  const avgBid = bids.reduce((s, b) => s + b.value, 0) / bids.length;
-  const avgAsk = asks.reduce((s, a) => s + a.value, 0) / asks.length;
-
-  const bidWalls = bids
-    .filter(b => b.value >= avgBid * 3 && b.price < currentPrice)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 3);
-
-  const askWalls = asks
-    .filter(a => a.value >= avgAsk * 3 && a.price > currentPrice)
-    .sort((a, b) => b.value - a.value)
-    .slice(0, 3);
-
-  // Pressure imbalance — top-10 each side
-  const bidPressure = bids.slice(0, 10).reduce((s, b) => s + b.value, 0);
-  const askPressure = asks.slice(0, 10).reduce((s, a) => s + a.value, 0);
-  const imbalance   = askPressure > 0 ? bidPressure / askPressure : 1;
-
-  // Spread
-  const bestBid  = bids[0]?.price || 0;
-  const bestAsk  = asks[0]?.price || 0;
-  const spreadPct = bestBid > 0 ? (bestAsk - bestBid) / bestBid * 100 : 0;
-
-  // Nearest walls to current price
-  const nearestBidWall = bidWalls[0] || null;
-  const nearestAskWall = askWalls[0] || null;
-
-  const imbalanceLabel = imbalance > 1.25 ? "BID_DOM" : imbalance < 0.80 ? "ASK_DOM" : "BALANCED";
-
+  const avgBid = bids.reduce((s,b)=>s+b.value,0)/bids.length;
+  const avgAsk = asks.reduce((s,a)=>s+a.value,0)/asks.length;
+  const bidWalls = bids.filter(b=>b.value>=avgBid*3&&b.price<currentPrice).sort((a,b)=>b.value-a.value).slice(0,3);
+  const askWalls = asks.filter(a=>a.value>=avgAsk*3&&a.price>currentPrice).sort((a,b)=>b.value-a.value).slice(0,3);
+  const bidPressure = bids.slice(0,10).reduce((s,b)=>s+b.value,0);
+  const askPressure = asks.slice(0,10).reduce((s,a)=>s+a.value,0);
+  const imbalance   = askPressure>0 ? bidPressure/askPressure : 1;
+  const bestBid=bids[0]?.price||0, bestAsk=asks[0]?.price||0;
+  const spreadPct = bestBid>0 ? (bestAsk-bestBid)/bestBid*100 : 0;
+  const lbl = imbalance>1.25?"BID_DOM":imbalance<0.80?"ASK_DOM":"BALANCED";
   return {
-    bidWalls, askWalls,
-    imbalance: +imbalance.toFixed(3),
-    imbalanceLabel,
-    spreadPct: +spreadPct.toFixed(5),
-    nearestSupport:    nearestBidWall ? nearestBidWall.price : null,
-    nearestResistance: nearestAskWall ? nearestAskWall.price : null,
-    bullish: imbalance > 1.25,
-    bearish: imbalance < 0.80,
-    // One-line summary for Claude prompt
-    summary: [
-      `Imbalance:${imbalance.toFixed(2)}x(${imbalanceLabel})`,
-      `Spread:${spreadPct.toFixed(4)}%`,
-      bidWalls.length  ? `BidWalls:${bidWalls.map(w=>`$${w.price.toFixed(4)}=$${(w.value/1000).toFixed(0)}K`).join(",")}` : "NoBidWall",
-      askWalls.length  ? `AskWalls:${askWalls.map(w=>`$${w.price.toFixed(4)}=$${(w.value/1000).toFixed(0)}K`).join(",")}` : "NoAskWall",
-    ].join(" | ")
+    bidWalls, askWalls, imbalance:+imbalance.toFixed(3), imbalanceLabel:lbl,
+    spreadPct:+spreadPct.toFixed(5),
+    nearestSupport:    bidWalls[0]?.price||null,
+    nearestResistance: askWalls[0]?.price||null,
+    bullish:imbalance>1.25, bearish:imbalance<0.80,
+    summary:[`Imbalance:${imbalance.toFixed(2)}x(${lbl})`,`Spread:${spreadPct.toFixed(4)}%`,
+      bidWalls.length?`BidWalls:${bidWalls.map(w=>`$${w.price.toFixed(4)}=$${(w.value/1000).toFixed(0)}K`).join(",")}`:"NoBidWall",
+      askWalls.length?`AskWalls:${askWalls.map(w=>`$${w.price.toFixed(4)}=$${(w.value/1000).toFixed(0)}K`).join(",")}`:"NoAskWall",
+    ].join(" | "),
   };
 }
 
-module.exports = { ticker, klines, orderbook, instruments, announcements, fundingRate, getBalances, placeOrder, analyzeOrderbook };
+module.exports = { ticker, klines, klinesOpt, orderbook, instruments, announcements, fundingRate, tickers24h, getBalances, placeOrder, analyzeOrderbook };

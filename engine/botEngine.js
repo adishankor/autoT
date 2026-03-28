@@ -425,38 +425,42 @@ function effectiveMinConf(s, ctx) {
   return Math.max(50, Math.min(95, Math.round(conf)));
 }
 
-// ── Fetch all data for a coin — now includes 1D timeframe ────────────────────
+// ── Fetch all data for a coin — 1D is optional (non-fatal) ───────────────────
 async function fetchCoinData(symbol) {
-  const [k15,k5,k60,k240,k1d,obData] = await Promise.all([
+  // PRIMARY: 15m, 5m, 1h, 4h klines + orderbook — all must succeed
+  // OPTIONAL: 1D klines — use klinesOpt (returns null on failure, never throws)
+  const [k15, k5, k60, k240, k1d, _obIgnored] = await Promise.all([
     bybit.klines(symbol,"15",80),
     bybit.klines(symbol,"5", 40),
     bybit.klines(symbol,"60",60),
     bybit.klines(symbol,"240",30),
-    bybit.klines(symbol,"D", 30),   // Day candles — trend context
-    ob.getOrderbookAnalysis(symbol,0).catch(()=>null),
+    bybit.klinesOpt(symbol,"D",30),   // optional — null if Bybit blocks
+    Promise.resolve(null),
   ]);
   const i15 = ind.calcAll(k15);
   if (!i15) return null;
-  const multiTF = { "5m":ind.calcAll(k5), "15m":i15, "1h":ind.calcAll(k60), "4h":ind.calcAll(k240), "1d":ind.calcAll(k1d) };
+  const multiTF = {
+    "5m":  ind.calcAll(k5),
+    "15m": i15,
+    "1h":  ind.calcAll(k60),
+    "4h":  ind.calcAll(k240),
+    "1d":  k1d ? ind.calcAll(k1d) : null,   // null = skipped cleanly
+  };
   const mtfAgreement = ind.mtfAgreement(multiTF, state.settings.mtfRequired);
   const obFull = await ob.getOrderbookAnalysis(symbol, i15.price).catch(()=>({available:false}));
   return { i15, multiTF, mtfAgreement, ob:obFull };
 }
 
-// ── Quick scan: tech score only (no news) — for upgrade comparison ─────────────
+// ── Quick scan: tech score only (no news/AI) — for upgrade comparison ─────────
 async function quickScanCoin(symbol) {
   try {
-    const [k15, obData] = await Promise.all([
-      bybit.klines(symbol,"15",60),
-      ob.getOrderbookAnalysis(symbol,0).catch(()=>null)
-    ]);
-    const i15 = ind.calcAll(k15);
+    const k15 = await bybit.klines(symbol,"15",60);
+    const i15  = ind.calcAll(k15);
     if (!i15) return null;
     const multiTF = { "5m":null, "15m":i15, "1h":null, "4h":null };
-    const mtfAgreement = ind.mtfAgreement(multiTF, 1); // 1 TF is enough for quick check
+    const mtfAgreement = ind.mtfAgreement(multiTF, 1);
     const obFull = await ob.getOrderbookAnalysis(symbol, i15.price).catch(()=>({available:false}));
-    const techScore = claude.quickScore(i15, mtfAgreement, obFull);
-    return { symbol, techScore, i15, mtfAgreement, ob:obFull };
+    return { symbol, techScore:claude.quickScore(i15, mtfAgreement, obFull), i15, mtfAgreement, ob:obFull };
   } catch { return null; }
 }
 
@@ -810,7 +814,7 @@ async function start() {
   state.running   = true;
   state.scanCount = 0;
   await refreshBDT();
-  log("🚀 Bot started | scan:"+s.scanIntervalSec+"s no-position | "+s.positionScanSec+"s position | stables excluded ✅","success");
+  log("🚀 V5 Bot started | scan:"+s.scanIntervalSec+"s no-position | "+s.positionScanSec+"s position | stables excluded ✅ | news cache:30min | ann:4h | fallback domains ✅","success");
 
   // Start scan — use dynamic interval based on position state
   const firstInterval = s.scanIntervalSec * 1000;
