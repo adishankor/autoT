@@ -7,6 +7,31 @@ const reporter = require("./engine/reporter");
 const app  = express();
 const PORT = process.env.PORT || 3000;
 app.use(express.json());
+
+// ── Password Protection ───────────────────────────────────────────────────────
+// Set DASHBOARD_PASSWORD in Railway environment variables to enable.
+// If not set, dashboard is open (useful during initial setup).
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD;
+
+function authMiddleware(req, res, next) {
+  if (!DASHBOARD_PASSWORD) return next(); // no password set → open access
+
+  // Allow health check without auth (Railway uses this to verify deployment)
+  if (req.path === "/health") return next();
+
+  const auth = req.headers["authorization"];
+  if (auth) {
+    const b64 = auth.split(" ")[1] || "";
+    const [user, pass] = Buffer.from(b64, "base64").toString().split(":");
+    if (pass === DASHBOARD_PASSWORD) return next();
+  }
+
+  // Prompt browser login dialog
+  res.set("WWW-Authenticate", 'Basic realm="Claude Bybit Bot"');
+  res.status(401).send("Authentication required");
+}
+
+app.use(authMiddleware);
 app.use(express.static(path.join(__dirname,"public")));
 
 // Bot controls
